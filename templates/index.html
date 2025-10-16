@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tweet Importer</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <div class="container">
+        <h1>Tweet Importer</h1>
+        <p>To use this, you'll first need to request a copy of your Twitter data <a href="https://x.com/settings/download_your_data" target="_blank">here</a>.</p>
+        <p>There is generally a delay of several hours (or days) in between your request and the link to download your data.</p>
+        <p>Once you've downloaded your data, unzip the file, you'll just need the `data/tweets.js` file for this importer.</p>
+        {% if error %}
+            <p class="error">{{ error }}</p>
+        {% endif %}
+
+        {% if success %}
+            <p class="success">{{ success }}</p>
+        {% endif %}
+
+        {% if failed_imports %}
+            <div class="failed-imports">
+                <h3>Failed Imports</h3>
+                <p>The following tweets could not be imported:</p>
+                <ul>
+                    {% for failed in failed_imports %}
+                        <li>
+                            <p>"{{ failed.tweet }}"</p>
+                            <small>Reason: {{ failed.reason }}</small>
+                        </li>
+                    {% endfor %}
+                </ul>
+            </div>
+        {% endif %}
+
+        {% if page == 'select_tweets' %}
+            <div id="import-form-container">
+                <form id="import-form" action="/import_tweets" method="post">
+                    <h2>Select Tweets to Import</h2>
+                    <p>Tip: Select one tweet, then hold down the Shift key while clicking on another tweet, and each tweet inbetween the two will be selected.</p>
+                    <div class="controls">
+                        <button type="button" id="select-all">Select All</button>
+                        <button type="button" id="deselect-all">Deselect All</button>
+                    </div>
+                    <div id="tweet-counter-container">
+                        <p><span id="selected-count">0</span> out of {{ tweets|length }} tweets selected.</p>
+                        <div id="rate-limit-warning" class="error" style="display: none;">
+                            Warning: Bluesky has a rate limit of 1,666 posts per hour and 11,666 posts per day. Importing more than 1,666 tweets at once may cause issues.
+                        </div>
+                        <div id="hard-cap-warning" class="error" style="display: none;">
+                            You have selected more than the daily limit of 11,666 tweets. Please select fewer tweets to continue.
+                        </div>
+                    </div>
+                    <div class="tweet-list">
+                        {% for tweet in tweets %}
+                            <div class="tweet">
+                                <input type="checkbox" name="tweet_indices" value="{{ loop.index0 }}" id="tweet-{{ loop.index0 }}">
+                                <label for="tweet-{{ loop.index0 }}">
+                                    <p>{{ tweet.tweet.full_text }}</p>
+                                    <small>{{ tweet.tweet.created_at }}</small>
+                                </label>
+                            </div>
+                        {% endfor %}
+                    </div>
+                    <button type="submit" id="import-submit-button">Import Selected Tweets</button>
+                </form>
+            </div>
+
+            <div id="progress-container" style="display: none;">
+                <h2>Importing Tweets...</h2>
+                <progress id="progress-bar" value="0" max="100"></progress>
+                <p id="progress-count">Starting...</p>
+                <div class="progress-details">
+                    <p><strong>Last Successful Import:</strong></p>
+                    <p id="last-success-tweet">-</p>
+                    <p><strong>Next Tweet to Import:</strong></p>
+                    <p id="next-tweet">-</p>
+                </div>
+                <div id="final-status"></div>
+            </div>
+
+            <a href="/logout">Logout</a>
+                    {% else %}
+            {% if 'handle' not in session %}
+                <form action="/login" method="post">
+                    <h2>Login to Bluesky</h2>
+                    <p>It is recommended to use an <a href="https://bsky.app/settings/app-passwords">app password</a>.</p>
+                    <input type="text" name="handle" placeholder="Bluesky Handle" required>
+                    <input type="password" name="password" placeholder="Password" required>
+                    <button type="submit">Login</button>
+                </form>
+            {% else %}
+                <p>Logged in as <strong>{{ session['handle'] }}</strong>. <a href="/logout">Logout</a></p>
+            {% endif %}
+
+            <form action="/upload" method="post" enctype="multipart/form-data">
+                <h2>Upload your tweets.js file</h2>
+                <input type="file" name="file" accept=".js" required {% if 'handle' not in session %}disabled{% endif %}>
+                <button type="submit" {% if 'handle' not in session %}disabled{% endif %}>Upload</button>
+            </form>
+        {% endif %}
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const importForm = document.getElementById('import-form');
+            if (importForm) {
+                const selectAllButton = document.getElementById('select-all');
+                const deselectAllButton = document.getElementById('deselect-all');
+                const checkboxes = document.querySelectorAll('input[name="tweet_indices"]');
+                const selectedCountSpan = document.getElementById('selected-count');
+                const rateLimitWarning = document.getElementById('rate-limit-warning');
+                const hardCapWarning = document.getElementById('hard-cap-warning');
+                const importSubmitButton = document.getElementById('import-submit-button');
+
+                function updateTweetCount() {
+                    const selectedCheckboxes = document.querySelectorAll('input[name="tweet_indices"]:checked');
+                    const count = selectedCheckboxes.length;
+                    if (selectedCountSpan) {
+                        selectedCountSpan.textContent = count;
+                    }
+
+                    if (count > 11666) {
+                        hardCapWarning.style.display = 'block';
+                        rateLimitWarning.style.display = 'none';
+                        importSubmitButton.disabled = true;
+                    } else if (count > 1666) {
+                        hardCapWarning.style.display = 'none';
+                        rateLimitWarning.style.display = 'block';
+                        importSubmitButton.disabled = false;
+                    } else {
+                        hardCapWarning.style.display = 'none';
+                        rateLimitWarning.style.display = 'none';
+                        importSubmitButton.disabled = false;
+                    }
+                }
+
+                updateTweetCount();
+
+                let lastChecked = null;
+                checkboxes.forEach(checkbox => {
+                    checkbox.addEventListener('click', function(event) {
+                        if (event.shiftKey && lastChecked) {
+                            const checkboxesArray = Array.from(checkboxes);
+                            const start = checkboxesArray.indexOf(this);
+                            const end = checkboxesArray.indexOf(lastChecked);
+                            checkboxesArray.slice(Math.min(start, end), Math.max(start, end) + 1).forEach(cb => {
+                                cb.checked = this.checked;
+                            });
+                        }
+                        lastChecked = this;
+                        updateTweetCount();
+                    });
+                });
+
+                if (selectAllButton) {
+                    selectAllButton.addEventListener('click', () => {
+                        checkboxes.forEach(checkbox => checkbox.checked = true);
+                        updateTweetCount();
+                    });
+                }
+
+                if (deselectAllButton) {
+                    deselectAllButton.addEventListener('click', () => {
+                        checkboxes.forEach(checkbox => checkbox.checked = false);
+                        updateTweetCount();
+                    });
+                }
+
+                importForm.addEventListener('submit', async (event) => {
+                    event.preventDefault();
+
+                    const allCheckboxes = document.querySelectorAll('input[name="tweet_indices"]');
+                    const selectedIndices = [];
+                    const unselectedIndices = [];
+
+                    allCheckboxes.forEach(checkbox => {
+                        if (checkbox.checked) {
+                            selectedIndices.push(checkbox.value);
+                        } else {
+                            unselectedIndices.push(checkbox.value);
+                        }
+                    });
+
+                    if (selectedIndices.length === 0) {
+                        alert('Please select at least one tweet to import.');
+                        return;
+                    }
+
+                    if (selectedIndices.length > 11666) {
+                        alert('You cannot import more than 11,666 tweets at a time.');
+                        return;
+                    }
+
+                    const newFormData = new FormData();
+                    if (selectedIndices.length <= unselectedIndices.length) {
+                        selectedIndices.forEach(index => newFormData.append('tweet_indices', index));
+                        newFormData.append('inversion', 'false');
+                    } else {
+                        unselectedIndices.forEach(index => newFormData.append('tweet_indices', index));
+                        newFormData.append('inversion', 'true');
+                    }
+
+                    document.getElementById('import-form-container').style.display = 'none';
+                    document.getElementById('progress-container').style.display = 'block';
+
+                    try {
+                        const startResponse = await fetch('/start_import', {
+                            method: 'POST',
+                            body: newFormData
+                        });
+
+                        const startData = await startResponse.json();
+
+                        if (!startResponse.ok) {
+                            throw new Error(startData.error || 'Failed to start import process.');
+                        }
+
+                        const indicesFilepath = startData.indices_filepath;
+                        if (!indicesFilepath) {
+                            throw new Error('Did not receive indices file path from server.');
+                        }
+
+                        const progressBar = document.getElementById('progress-bar');
+                        const progressCount = document.getElementById('progress-count');
+                        const lastSuccessTweet = document.getElementById('last-success-tweet');
+                        const nextTweet = document.getElementById('next-tweet');
+                        const finalStatus = document.getElementById('final-status');
+
+                        // If POST is successful, start listening for progress
+                        const eventSourceUrl = `/import_tweets?indices_filepath=${encodeURIComponent(indicesFilepath)}`;
+                        const eventSource = new EventSource(eventSourceUrl);
+
+                        eventSource.onmessage = function(event) {
+                            const data = JSON.parse(event.data);
+
+                            if (data.error) {
+                                finalStatus.innerHTML = `<p class="error">An error occurred: ${data.error}</p>`;
+                                eventSource.close();
+                                return;
+                            }
+
+                            if (data.final) {
+                                progressBar.value = progressBar.max;
+                                progressCount.textContent = `Import complete!`;
+                                finalStatus.innerHTML = `<p class="success">Successfully imported ${data.successful} of ${data.total} tweets.</p><a href="/select_tweets">Import More</a>`;
+                                eventSource.close();
+                                return;
+                            }
+
+                            progressBar.max = data.total;
+                            progressBar.value = data.current;
+                            progressCount.textContent = `Importing ${data.current} of ${data.total}...`;
+                            lastSuccessTweet.textContent = data.last_success || '-';
+                            nextTweet.textContent = data.next_tweet;
+                        };
+
+                        eventSource.onerror = function(err) {
+                            finalStatus.innerHTML = '<p class="error">An error occurred with the connection.</p>';
+                            console.error("EventSource failed:", err);
+                            eventSource.close();
+                        };
+
+                    } catch (error) {
+                        document.getElementById('progress-container').style.display = 'none';
+                        document.getElementById('import-form-container').style.display = 'block';
+                        alert(`Error: ${error.message}`);
+                    }
+                });
+            }
+        });
+    </script>
+</body>
+</html>
